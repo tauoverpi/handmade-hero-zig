@@ -13,41 +13,56 @@ usingnamespace @import("win32").ui.windows_and_messaging;
 usingnamespace @import("win32").graphics.gdi;
 
 var running: bool = true;
-var bitmap_memory: ?[*]u8 = null;
-var bitmap_info = mem.zeroes(BITMAPINFO);
-var bitmap_handle: ?HBITMAP = null;
-var device_context: HDC = undefined;
-var bitmap_width: i32 = undefined;
-var bitmap_height: i32 = undefined;
+var back_buffer: ScreenBuffer = undefined;
 
-fn renderOddGradient(x_offset: u32, y_offset: u32) void {
-    _ = x_offset;
-    _ = y_offset;
-    const pitch = @intCast(u32, bitmap_width) * 4;
+const ScreenBuffer = struct {
+    memory: ?[*]u8 = null,
+    info: BITMAPINFO = mem.zeroes(BITMAPINFO),
+    width: i32,
+    pitch: u32,
+    height: i32,
+};
+
+fn windowDimensions(window: HWND) struct { width: i32, height: i32 } {
+    var client_rect: RECT = undefined;
+    _ = GetClientRect(window, &client_rect);
+
+    const height = client_rect.bottom - client_rect.top;
+    const width = client_rect.right - client_rect.left;
+
+    return .{
+        .width = width,
+        .height = height,
+    };
+}
+
+fn renderOddGradient(bitmap: ScreenBuffer, x_offset: u32, y_offset: u32) void {
     var y: u32 = 0;
-    var row = bitmap_memory.?;
-    while (y < bitmap_height) : (y += 1) {
+    var row = bitmap.memory.?;
+    while (y < bitmap.height) : (y += 1) {
         var x: u32 = 0;
         var pixel = @ptrCast([*]u32, @alignCast(4, row));
-        while (x < bitmap_width) : (x += 1) {
+        while (x < bitmap.width) : (x += 1) {
             pixel.* = (x +% x_offset) | ((y +% y_offset) << 8);
             pixel += 1;
         }
-        row += pitch;
+        row += bitmap.pitch;
     }
 }
 
-fn resizeDibSection(width: i32, height: i32) void {
-    if (bitmap_memory) |memory| {
+fn resizeDibSection(bitmap: *ScreenBuffer, width: i32, height: i32) error{OutOfMemory}!void {
+    if (bitmap.memory) |memory| {
         _ = VirtualFree(@ptrCast(*c_void, memory), 0, MEM_RELEASE);
     }
 
-    bitmap_height = height;
-    bitmap_width = width;
+    bitmap.height = height;
+    bitmap.width = width;
+    bitmap.pitch = @intCast(u32, bitmap.width) * 4;
 
-    bitmap_info.bmiHeader = .{
-        .biSize = @sizeOf(@TypeOf(bitmap_info.bmiHeader)),
+    bitmap.info.bmiHeader = .{
+        .biSize = @sizeOf(@TypeOf(bitmap.info.bmiHeader)),
         .biWidth = width,
+        // negative for top-down index
         .biHeight = -height,
         .biPlanes = 1,
         .biBitCount = 32,
@@ -59,35 +74,33 @@ fn resizeDibSection(width: i32, height: i32) void {
         .biClrImportant = 0,
     };
 
-    const size = @intCast(usize, bitmap_width) * @intCast(usize, bitmap_height) * 4;
-    bitmap_memory = @ptrCast([*]u8, VirtualAlloc(null, size, MEM_COMMIT, PAGE_READWRITE));
+    const size = @intCast(usize, bitmap.width) * @intCast(usize, bitmap.height) * 4;
+    const memory = @ptrCast(?[*]u8, VirtualAlloc(null, size, MEM_COMMIT, PAGE_READWRITE));
+    bitmap.memory = memory orelse return error.OutOfMemory;
 
     // TODO: clear
 }
 
-fn updateWindow(ctx: HDC, rect: RECT, x: i32, y: i32, width: i32, height: i32) void {
-    _ = x; // TODO: use
-    _ = y; // TODO: use
-    _ = width; // TODO: use
-    _ = height; // TODO: use
-
-    const wh = rect.bottom - rect.top;
-    const ww = rect.right - rect.left;
-
+fn updateWindow(
+    bitmap: ScreenBuffer,
+    ctx: HDC,
+    window_width: i32,
+    window_height: i32,
+) void {
     _ = StretchDIBits(
         ctx,
         // dest rect
         0, //x,
         0, //y,
-        bitmap_width,
-        bitmap_height,
+        window_width,
+        window_height,
         // source rect
         0, //x,
         0, //y,
-        ww,
-        wh,
-        bitmap_memory,
-        &bitmap_info,
+        bitmap.width,
+        bitmap.height,
+        bitmap.memory,
+        &bitmap.info,
         DIB_RGB_COLORS,
         SRCCOPY,
     );
@@ -99,24 +112,13 @@ fn mainWindowCallback(
     wparam: WPARAM,
     lparam: LPARAM,
 ) callconv(.C) LRESULT {
-    _ = window;
     _ = wparam;
     _ = lparam;
 
     var result: LRESULT = 0;
 
     switch (message) {
-        WM_SIZE => {
-            var client_rect: RECT = undefined;
-            _ = GetClientRect(window, &client_rect);
-
-            const height = client_rect.bottom - client_rect.top;
-            const width = client_rect.right - client_rect.left;
-
-            resizeDibSection(width, height);
-
-            std.log.info("size", .{});
-        },
+        WM_SIZE => {},
 
         WM_DESTROY => {
             running = false;
@@ -138,16 +140,10 @@ fn mainWindowCallback(
             const ctx = BeginPaint(window, &paint);
             defer _ = EndPaint(window, &paint);
 
-            const x = paint.rcPaint.left;
-            const y = paint.rcPaint.top;
-            const height = paint.rcPaint.bottom - paint.rcPaint.top;
-            const width = paint.rcPaint.right - paint.rcPaint.left;
-
-            var client_rect: RECT = undefined;
-            _ = GetClientRect(window, &client_rect);
-
-            updateWindow(ctx, client_rect, x, y, width, height);
+            const dim = windowDimensions(window);
+            updateWindow(back_buffer, ctx, dim.width, dim.height);
         },
+
         else => {
             result = DefWindowProcA(window, message, wparam, lparam);
         },
@@ -166,7 +162,10 @@ pub fn wWinMain(
     _ = cl;
     _ = show;
 
+    resizeDibSection(&back_buffer, 1280, 720) catch @panic("out of memory");
+
     var wnd = mem.zeroes(WNDCLASSEXA);
+    wnd.style = @intToEnum(WNDCLASS_STYLES, @enumToInt(CS_HREDRAW) | @enumToInt(CS_VREDRAW));
     wnd.cbSize = @sizeOf(WNDCLASSEXA);
     wnd.hInstance = instance;
     wnd.lpszClassName = "HandClass";
@@ -194,6 +193,10 @@ pub fn wWinMain(
 
     var x_offset: u32 = 0;
     var y_offset: u32 = 0;
+
+    const ctx = GetDC(window);
+    defer _ = ReleaseDC(window, ctx);
+
     while (running) {
         while (PeekMessageA(&msg, null, 0, 0, PM_REMOVE) != 0) {
             if (msg.message == WM_QUIT) running = false;
@@ -201,19 +204,17 @@ pub fn wWinMain(
             _ = DispatchMessageA(&msg);
         }
 
-        renderOddGradient(x_offset, y_offset);
-        x_offset += 1;
+        renderOddGradient(back_buffer, x_offset, y_offset);
 
-        const ctx = GetDC(window);
-        defer _ = ReleaseDC(window, ctx);
+        x_offset +%= 1;
+        y_offset +%= 1;
 
         var client_rect: RECT = undefined;
         _ = GetClientRect(window, &client_rect);
 
-        const height = client_rect.bottom - client_rect.top;
-        const width = client_rect.right - client_rect.left;
+        const dim = windowDimensions(window);
 
-        updateWindow(ctx, client_rect, 0, 0, width, height);
+        updateWindow(back_buffer, ctx, dim.width, dim.height);
     }
 
     return 0;
